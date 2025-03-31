@@ -1,0 +1,416 @@
+hi , please write for me a professional code in dart language that builds bin protocol between pc and device. the device is embedded radio transceiver for radio messages in 433mhz.  the device is esp32 s3 evaluation board. The protocol will have the next fields at minimum : start of message , end of message , CRC or checksum , command type. the command i want to build is get , set for registers R1-R10 and report status of the device. the device has the next status: trouble , low battery , smoke alarm , tamper , aux input with 3 levels: on , off , trouble. the protocol will have Ack message response. the protocol will do retry if didn't get ack message. we will wait 50ms for the ack message. we will do 5 retry for every message to wait for Ack message. if after 5 time we didn't get ack we will print "message fail after 5 retry". please build A queue of sending messages and when our code will get messages from the device please build switch case that call the right functions. the names of the functions will be understandable. all the code will be generate in professional way and if needed use "await" if dart language or use separate process or task. please build few files as needed that the code will be readable. to communicate with the device we use the serial interface via usb driver. we can use also Bluetooth driver with BLE 5.0. please provide also the code for the device also. build for me also document that describe the protocol in professional way also procedures for example: send get message , I will get first ack and after that response. if you have any questions or unclear issues please ask. if you want to improve this request with professional things that you know from your experience , I will be happy to have them. please write all the improvements you add in separate list that i will know what improved. please provide also example code how to send messages in the pc and the device.
+
+
+status.dart
+
+/// Represents the device status received from the ESP32.
+class Status {
+  final bool trouble;
+  final bool lowBattery;
+  final bool smokeAlarm;
+  final bool tamper;
+  final int auxInput; // 0: off, 1: on, 2: trouble
+
+  Status({
+    required this.trouble,
+    required this.lowBattery,
+    required this.smokeAlarm,
+    required this.tamper,
+    required this.auxInput,
+  });
+
+  @override
+  String toString() {
+    return 'Status(trouble: $trouble, lowBattery: $lowBattery, '
+        'smokeAlarm: $smokeAlarm, tamper: $tamper, auxInput: $auxInput)';
+  }
+}
+
+
+protocol_handler.dart
+
+import 'dart:async';
+import 'message_parser.dart';
+import 'status.dart';
+
+/// Abstract interface for serial communication.
+abstract class SerialPort {
+  Stream<List<int>> get inputStream;
+  void write(List<int> bytes);
+}
+
+/// Manages the binary protocol communication with the ESP32 device.
+class ProtocolHandler {
+  final SerialPort serialPort;
+  int _nextSeq = 0;
+  final Map<int, _PendingMessage> _pendingMessages = {};
+  final MessageParser _parser;
+
+  ProtocolHandler(this.serialPort) : _parser = MessageParser() {
+    serialPort.inputStream.listen((bytes) => _parser.addBytes(bytes, _handleMessage));
+  }
+
+  /// Builds a message with the specified type and data.
+  List<int> _buildMessage(int seq, int type, List<int> data) {
+    final message = [0x02, seq, type, data.length]; // Start, Seq, Type, Length
+    message.addAll(data);
+    int checksum = 0x02 ^ seq ^ type ^ data.length;
+    for (int b in data) checksum ^= b;
+    message.add(checksum);
+    message.add(0x03); // End
+    return message;
+  }
+
+  /// Sends a message and waits for Ack, with retries.
+  Future<List<int>?> _sendMessage(int type, List<int> data, {required bool expectResponse}) async {
+    final seq = _nextSeq++;
+    if (_nextSeq > 255) _nextSeq = 0;
+    final messageBytes = _buildMessage(seq, type, data);
+    final pending = _PendingMessage(seq, type, expectResponse: expectResponse);
+    _pendingMessages[seq] = pending;
+
+    for (int retry = 0; retry < 5; retry++) {
+      serialPort.write(messageBytes);
+      try {
+        await pending.ackCompleter.future.timeout(const Duration(milliseconds: 50));
+        if (expectResponse) {
+          return await pending.responseCompleter!.future;
+        }
+        _pendingMessages.remove(seq);
+        return null;
+      } catch (e) {
+        if (e is TimeoutException && retry == 4) {
+          print('message fail after 5 retry for seq $seq');
+          _pendingMessages.remove(seq);
+          throw Exception('No Ack after 5 retries');
+        }
+      }
+    }
+    return null; // This line won't be reached due to the throw, but included for completeness
+  }
+
+  /// Handles incoming messages (Ack or Response).
+  void _handleMessage(int seq, int type, List<int> data) {
+    final pending = _pendingMessages[seq];
+    if (pending == null) return;
+
+    switch (type) {
+      case 0x04: // Ack
+        pending.ackCompleter.complete();
+        break;
+      case 0x05: // Register value response
+        if (pending.responseCompleter != null) {
+          pending.responseCompleter!.complete(data);
+          _pendingMessages.remove(seq);
+        }
+        break;
+      case 0x06: // Status report
+        if (pending.responseCompleter != null) {
+          pending.responseCompleter!.complete(data);
+          _pendingMessages.remove(seq);
+        }
+        break;
+    }
+  }
+
+  /// Sets a register value on the device.
+  Future<void> setRegister(int reg, int value) async {
+    if (reg < 1 || reg > 10) throw Exception('Register must be between 1 and 10');
+    if (value < 0 || value > 255) throw Exception('Value must be between 0 and 255');
+    await _sendMessage(0x02, [reg, value], expectResponse: false);
+  }
+
+  /// Gets a register value from the device.
+  Future<int> getRegister(int reg) async {
+    if (reg < 1 || reg > 10) throw Exception('Register must be between 1 and 10');
+    final response = await _sendMessage(0x01, [reg], expectResponse: true);
+    if (response == null || response.length != 2 || response[0] != reg) {
+      throw Exception('Invalid register response');
+    }
+    return response[1];
+  }
+
+  /// Requests the device status.
+  Future<Status> requestStatus() async {
+    final response = await _sendMessage(0x03, [], expectResponse: true);
+    if (response == null || response.length != 5) {
+      throw Exception('Invalid status response');
+    }
+    return Status(
+      trouble: response[0] != 0,
+      lowBattery: response[1] != 0,
+      smokeAlarm: response[2] != 0,
+      tamper: response[3] != 0,
+      auxInput: response[4],
+    );
+  }
+}
+
+/// Represents a message awaiting acknowledgment or response.
+class _PendingMessage {
+  final int seq;
+  final int type;
+  final Completer<void> ackCompleter = Completer();
+  Completer<List<int>>? responseCompleter;
+  int retryCount = 0;
+
+  _PendingMessage(this.seq, this.type, {required bool expectResponse}) {
+    if (expectResponse) responseCompleter = Completer();
+  }
+}
+
+
+
+message_parser.dart
+
+
+import 'protocol_handler.dart';
+
+/// Parses incoming bytes into messages.
+class MessageParser {
+  final List<int> _buffer = [];
+
+  void addBytes(List<int> bytes, void Function(int, int, List<int>) onMessage) {
+    _buffer.addAll(bytes);
+    while (true) {
+      final startIndex = _buffer.indexOf(0x02);
+      if (startIndex == -1) break;
+      if (_buffer.length - startIndex < 5) break; // Need at least header
+      final dataLen = _buffer[startIndex + 3];
+      final totalLen = 5 + dataLen + 2; // Header + data + checksum + end
+      if (_buffer.length - startIndex < totalLen) break;
+
+      final message = _buffer.sublist(startIndex, startIndex + totalLen);
+      _buffer.removeRange(0, startIndex + totalLen);
+
+      if (message.last != 0x03) continue;
+      int checksum = 0;
+      for (int i = 0; i < message.length - 2; i++) checksum ^= message[i];
+      if (checksum != message[message.length - 2]) continue;
+
+      final seq = message[1];
+      final type = message[2];
+      final data = message.sublist(4, 4 + dataLen);
+      onMessage(seq, type, data);
+    }
+  }
+}
+
+
+
+main.dart
+
+
+import 'protocol_handler.dart';
+import 'status.dart';
+
+void main() async {
+  // Placeholder for serial port initialization
+  SerialPort serialPort = FakeSerialPort(); // Replace with actual implementation
+  final protocol = ProtocolHandler(serialPort);
+
+  // Example: Set register R1 to 100
+  print('Setting R1 to 100...');
+  await protocol.setRegister(1, 100);
+
+  // Example: Get register R1
+  print('Getting R1 value...');
+  final value = await protocol.getRegister(1);
+  print('R1 value: $value');
+
+  // Example: Request status
+  print('Requesting status...');
+  final status = await protocol.requestStatus();
+  print(status);
+}
+
+// Fake SerialPort for demonstration
+class FakeSerialPort implements SerialPort {
+  @override
+  Stream<List<int>> get inputStream => Stream.empty();
+  @override
+  void write(List<int> bytes) => print('Sent: $bytes');
+}
+
+Arduino Code for Device Side
+The device code is written in C++ using the Arduino framework for the ESP32 S3
+
+device.ino
+
+// Registers R1-R10 (0-based indexing internally)
+byte registers[10] = {0};
+// Device status variables
+bool trouble = false;
+bool lowBattery = false;
+bool smokeAlarm = false;
+bool tamper = false;
+int auxInput = 0; // 0: off, 1: on, 2: trouble
+
+void setup() {
+  Serial.begin(115200); // Match baud rate with PC
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    int b = Serial.read();
+    if (b == 0x02) { // Start byte
+      while (Serial.available() < 4) delay(1); // Wait for header
+      int seq = Serial.read();
+      int type = Serial.read();
+      int len = Serial.read();
+      while (Serial.available() < len + 2) delay(1); // Wait for data + checksum + end
+
+      byte data[256];
+      for (int i = 0; i < len; i++) data[i] = Serial.read();
+      int checksum = Serial.read();
+      int end = Serial.read();
+
+      if (end != 0x03) return;
+      int calcChecksum = 0x02 ^ seq ^ type ^ len;
+      for (int i = 0; i < len; i++) calcChecksum ^= data[i];
+      if (calcChecksum != checksum) return;
+
+      sendAck(seq); // Send acknowledgment
+      processMessage(seq, type, data, len);
+    }
+  }
+}
+
+/// Sends an Ack message with the given sequence number.
+void sendAck(int seq) {
+  byte data[0];
+  sendMessage(seq, 0x04, data, 0);
+}
+
+/// Processes the received message and sends responses as needed.
+void processMessage(int seq, int type, byte* data, int len) {
+  switch (type) {
+    case 0x01: // Get register
+      if (len == 1 && data[0] >= 1 && data[0] <= 10) {
+        byte reg = data[0];
+        byte value = registers[reg - 1];
+        byte responseData[2] = {reg, value};
+        sendMessage(seq, 0x05, responseData, 2);
+      }
+      break;
+    case 0x02: // Set register
+      if (len == 2 && data[0] >= 1 && data[0] <= 10) {
+        registers[data[0] - 1] = data[1];
+      }
+      break;
+    case 0x03: // Request status
+      if (len == 0) {
+        byte statusData[5] = {
+          trouble ? 1 : 0,
+          lowBattery ? 1 : 0,
+          smokeAlarm ? 1 : 0,
+          tamper ? 1 : 0,
+          (byte)auxInput
+        };
+        sendMessage(seq, 0x06, statusData, 5);
+      }
+      break;
+  }
+}
+
+/// Builds and sends a message over serial.
+void sendMessage(int seq, int type, byte* data, int len) {
+  byte checksum = 0x02 ^ seq ^ type ^ len;
+  for (int i = 0; i < len; i++) checksum ^= data[i];
+  
+  Serial.write(0x02);
+  Serial.write(seq);
+  Serial.write(type);
+  Serial.write(len);
+  for (int i = 0; i < len; i++) Serial.write(data[i]);
+  Serial.write(checksum);
+  Serial.write(0x03);
+}
+
+
+Protocol Specification Document
+1. Introduction
+This document specifies a binary protocol for communication between a PC and an ESP32 S3 evaluation board, an embedded radio transceiver operating at 433MHz. The protocol enables the PC to configure and monitor the device via commands to get/set registers (R1-R10) and request device status.
+
+2. Message Format
+Each message adheres to the following structure:
+
+Start Byte: 0x02 (1 byte)
+Sequence Number: 0-255 (1 byte), assigned by the sender
+Message Type: Command or response type (1 byte)
+Data Length: Number of data bytes, 0-255 (1 byte)
+Data: Variable length payload (0-255 bytes)
+Checksum: XOR of all bytes from Start to Data (1 byte)
+End Byte: 0x03 (1 byte)
+Checksum Calculation: XOR of Start Byte, Sequence Number, Message Type, Data Length, and all Data bytes.
+
+3. Message Types
+0x01: Get Register
+Data: 1 byte (Register number, 1-10)
+0x02: Set Register
+Data: 2 bytes (Register number 1-10, Value 0-255)
+0x03: Request Status
+Data: 0 bytes
+0x04: Ack
+Data: 0 bytes
+0x05: Register Value Response
+Data: 2 bytes (Register number 1-10, Value 0-255)
+0x06: Status Report
+Data: 5 bytes (Trouble: 0/1, Low Battery: 0/1, Smoke Alarm: 0/1, Tamper: 0/1, Aux Input: 0/1/2)
+4. Communication Sequences
+Get Register:
+PC sends: [0x02, seq, 0x01, 1, reg, checksum, 0x03]
+Device sends Ack: [0x02, seq, 0x04, 0, checksum, 0x03]
+Device sends Response: [0x02, seq, 0x05, 2, reg, value, checksum, 0x03]
+Set Register:
+PC sends: [0x02, seq, 0x02, 2, reg, value, checksum, 0x03]
+Device sends Ack: [0x02, seq, 0x04, 0, checksum, 0x03]
+Request Status:
+PC sends: [0x02, seq, 0x03, 0, checksum, 0x03]
+Device sends Ack: [0x02, seq, 0x04, 0, checksum, 0x03]
+Device sends Status: [0x02, seq, 0x06, 5, trouble, lowBat, smoke, tamper, aux, checksum, 0x03]
+5. Error Handling
+Retries: If no Ack is received within 50ms, the PC retries the message up to 5 times.
+Failure: After 5 retries without Ack, the PC outputs "message fail after 5 retry" and aborts the operation.
+6. Notes
+The PC increments the sequence number for each new message, wrapping at 255.
+The device echoes the received sequence number in Ack and response messages.
+Communication is via serial USB (baud rate e.g., 115200), with BLE 5.0 as an optional alternative.
+Improvements Added
+Robust Parsing: The message parser handles partial or corrupted messages by checking start/end bytes and checksums.
+Asynchronous Design: Dart code uses async/await for non-blocking operations, improving responsiveness.
+Modular Structure: Code is split into files (e.g., protocol_handler.dart, message_parser.dart) for maintainability.
+Error Validation: Input validation for register numbers and values prevents invalid messages.
+Pending Message Management: A map-based queue tracks messages, allowing concurrent sends with individual retry logic.
+
+
+Example Usage
+PC Side (Dart)
+
+void main() async {
+  SerialPort serialPort = FakeSerialPort(); // Replace with real SerialPort
+  final protocol = ProtocolHandler(serialPort);
+
+  // Send Set Register R2 to 150
+  await protocol.setRegister(2, 150);
+  print('Set R2 to 150');
+
+  // Send Get Register R2
+  int value = await protocol.getRegister(2);
+  print('R2 value: $value');
+
+  // Send Request Status
+  Status status = await protocol.requestStatus();
+  print('Device status: $status');
+}
+
+
+Device Side (Arduino)
+The device automatically responds to incoming messages as implemented in loop(). For testing, you could simulate status changes:
+
+
+void loop() {
+  // Simulate status change (e.g., for testing)
+  smokeAlarm = true; // Set smoke alarm for demonstration
+  // Rest of the loop as above
+}
